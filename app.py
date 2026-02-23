@@ -35,12 +35,17 @@ edge_output_filename = "edge_output.mp3"
 tts_voice_list = None
 tts_voices = None
 
-def _load_tts_voices():
+async def _load_tts_voices_async():
     global tts_voice_list, tts_voices
     if tts_voices is None:
-        tts_voice_list = asyncio.get_event_loop().run_until_complete(edge_tts.list_voices())
-        tts_voices = [f"{v['ShortName']}-{v['Gender']}" for v in tts_voice_list]
+        tts_voice_list = await edge_tts.list_voices()
+        tts_voices = [v['ShortName'] for v in tts_voice_list]
     return tts_voices
+
+
+def _load_tts_voices():
+    """Load TTS voices, handling async context properly."""
+    return _call_async_from_sync(_load_tts_voices_async())
 
 model_root = "weights"
 models = [d for d in os.listdir(model_root) if os.path.isdir(os.path.join(model_root, d))]
@@ -119,22 +124,6 @@ def load_hubert():
     return hubert_model.eval()
 
 
-print("Loading hubert model...")
-hubert_model = load_hubert()
-print("Hubert model loaded.")
-
-print("Loading rmvpe model...")
-rmvpe_model = RMVPE("rmvpe.pt", config.is_half, config.device)
-print("rmvpe model loaded.")
-
-
-async def _run_edge_tts(tts_text, tts_voice, speed_str, edge_output_filename):
-    """Helper to run edge-tts async. Can be called from sync or async context."""
-    await edge_tts.Communicate(
-        tts_text, "-".join(tts_voice.split("-")[:-1]), rate=speed_str
-    ).save(edge_output_filename)
-
-
 def _call_async_from_sync(coro):
     """Call async coroutine from sync context, handling existing event loops."""
     try:
@@ -153,6 +142,27 @@ def _call_async_from_sync(coro):
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(asyncio.run, coro)
             return future.result()
+
+
+print("Loading hubert model...")
+hubert_model = load_hubert()
+print("Hubert model loaded.")
+
+print("Loading rmvpe model...")
+rmvpe_model = RMVPE("rmvpe.pt", config.is_half, config.device)
+print("rmvpe model loaded.")
+
+print("Loading TTS voices...")
+tts_voices = _load_tts_voices()
+print(f"Loaded {len(tts_voices)} TTS voices")
+
+
+async def _run_edge_tts(tts_text, tts_voice, speed_str, edge_output_filename):
+    """Helper to run edge-tts async. Can be called from sync or async context."""
+    await edge_tts.Communicate(
+        tts_text, tts_voice, rate=speed_str
+    ).save(edge_output_filename)
+
 
 
 def tts(
@@ -277,10 +287,10 @@ with app:
     with gr.Row():
         with gr.Column():
             tts_voice = gr.Dropdown(
-                label="Edge-tts speaker (format: language-Country-Name-Gender)",
+                label="Edge-tts speaker (format: language-Country-Name)",
                 choices=tts_voices,
                 allow_custom_value=False,
-                value="ja-JP-NanamiNeural-Female",
+                value="ja-JP-NanamiNeural",
             )
             speed = gr.Slider(minimum=-100, maximum=100, label="Speech speed (%)", value=0, step=10, interactive=True)
             tts_text = gr.Textbox(label="Input Text", value="これは日本語テキストから音声への変換デモです。")
@@ -296,21 +306,21 @@ with app:
         examples = gr.Examples(
             examples_per_page=100,
             examples=[
-                ["これは日本語テキストから音声への変換デモです。", "ja-JP-NanamiNeural-Female"],
-                ["This is an English text to speech conversation demo.", "en-US-AriaNeural-Female"],
-                ["这是一个中文文本到语音的转换演示。", "zh-CN-XiaoxiaoNeural-Female"],
-                ["한국어 텍스트에서 음성으로 변환하는 데모입니다.", "ko-KR-SunHiNeural-Female"],
-                ["Il s'agit d'une démo de conversion du texte français à la parole.", "fr-FR-DeniseNeural-Female"],
-                ["Dies ist eine Demo zur Umwandlung von Deutsch in Sprache.", "de-DE-AmalaNeural-Female"],
-                ["Tämä on suomenkielinen tekstistä puheeksi -esittely.", "fi-FI-NooraNeural-Female"],
-                ["Это демонстрационный пример преобразования русского текста в речь.", "ru-RU-SvetlanaNeural-Female"],
-                ["Αυτή είναι μια επίδειξη μετατροπής ελληνικού κειμένου σε ομιλία.", "el-GR-AthinaNeural-Female"],
-                ["Esta es una demostración de conversión de texto a voz en español.", "es-ES-ElviraNeural-Female"],
-                ["Questa è una dimostrazione di sintesi vocale in italiano.", "it-IT-ElsaNeural-Female"],
-                ["Esta é uma demonstração de conversão de texto em fala em português.", "pt-PT-RaquelNeural-Female"],
-                ["Це демонстрація тексту до мовлення українською мовою.", "uk-UA-PolinaNeural-Female"],
-                ["هذا عرض توضيحي عربي لتحويل النص إلى كلام.", "ar-EG-SalmaNeural-Female"],
-                ["இது தமிழ் உரையிலிருந்து பேச்சு மாற்ற டெமோ.", "ta-IN-PallaviNeural-Female"],
+                ["これは日本語テキストから音声への変換デモです。", "ja-JP-NanamiNeural"],
+                ["This is an English text to speech conversation demo.", "en-US-AriaNeural"],
+                ["这是一个中文文本到语音的转换演示。", "zh-CN-XiaoxiaoNeural"],
+                ["한국어 텍스트에서 음성으로 변환하는 데모입니다.", "ko-KR-SunHiNeural"],
+                ["Il s'agit d'une démo de conversion du texte français à la parole.", "fr-FR-DeniseNeural"],
+                ["Dies ist eine Demo zur Umwandlung von Deutsch in Sprache.", "de-DE-AmalaNeural"],
+                ["Tämä on suomenkielinen tekstistä puheeksi -esittely.", "fi-FI-NooraNeural"],
+                ["Это демонстрационный пример преобразования русского текста в речь.", "ru-RU-SvetlanaNeural"],
+                ["Αυτή είναι μια επίδειξη μετατροπής ελληνικού κειμένου σε ομιλία.", "el-GR-AthinaNeural"],
+                ["Esta es una demostración de conversión de texto a voz en español.", "es-ES-ElviraNeural"],
+                ["Questa è una dimostrazione di sintesi vocale in italiano.", "it-IT-ElsaNeural"],
+                ["Esta é uma demonstração de conversão de texto em fala em português.", "pt-PT-RaquelNeural"],
+                ["Це демонстрація тексту до мовлення українською мовою.", "uk-UA-PolinaNeural"],
+                ["هذا عرض توضيحي عربي لتحويل النص إلى كلام.", "ar-EG-SalmaNeural"],
+                ["இது தமிழ் உரையிலிருந்து பேச்சு மாற்ற டெமோ.", "ta-IN-PallaviNeural"],
             ],
             inputs=[tts_text, tts_voice],
         )
