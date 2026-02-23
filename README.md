@@ -472,7 +472,7 @@ If this project helped you, please consider:
 
 ### Built with ❤️ for the Community
 
-Made with 🚀 by AI Enthusiasts | 2024
+Made with 🚀 by Rynz
 
 ⬆️ [Back to Top](#-universal-ocr-rest-api)
 
