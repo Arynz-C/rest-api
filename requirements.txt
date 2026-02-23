@@ -1,5 +1,6 @@
 edge-tts 
 aiohttp
+
 fairseq==0.12.2
 faiss_cpu==1.13.2
 gradio==3.38.0
