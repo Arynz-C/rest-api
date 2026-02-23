@@ -10,6 +10,7 @@ import gradio as gr
 import librosa
 import torch
 from fairseq import checkpoint_utils
+from fairseq.data.dictionary import Dictionary  # <-- untuk allowlist
 
 from config import Config
 from lib.infer_pack.models import (
@@ -28,24 +29,27 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
 limitation = os.getenv("SYSTEM") == "spaces"
-
 config = Config()
 
 edge_output_filename = "edge_output.mp3"
-tts_voice_list = asyncio.get_event_loop().run_until_complete(edge_tts.list_voices())
-tts_voices = [f"{v['ShortName']}-{v['Gender']}" for v in tts_voice_list]
+tts_voice_list = None
+tts_voices = None
+
+def _load_tts_voices():
+    global tts_voice_list, tts_voices
+    if tts_voices is None:
+        tts_voice_list = asyncio.get_event_loop().run_until_complete(edge_tts.list_voices())
+        tts_voices = [f"{v['ShortName']}-{v['Gender']}" for v in tts_voice_list]
+    return tts_voices
 
 model_root = "weights"
-models = [
-    d for d in os.listdir(model_root) if os.path.isdir(os.path.join(model_root, d))
-]
+models = [d for d in os.listdir(model_root) if os.path.isdir(os.path.join(model_root, d))]
 if len(models) == 0:
     raise ValueError("No model found in `weights` folder")
 models.sort()
 
 
 def model_data(model_name):
-    # global n_spk, tgt_sr, net_g, vc, cpt, version, index_file
     pth_files = [
         os.path.join(model_root, model_name, f)
         for f in os.listdir(os.path.join(model_root, model_name))
@@ -81,7 +85,6 @@ def model_data(model_name):
     else:
         net_g = net_g.float()
     vc = VC(tgt_sr, config)
-    # n_spk = cpt["config"][-3]
 
     index_files = [
         os.path.join(model_root, model_name, f)
@@ -100,10 +103,13 @@ def model_data(model_name):
 
 def load_hubert():
     global hubert_model
-    models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
-        ["hubert_base.pt"],
-        suffix="",
-    )
+    # Patch untuk fairseq lama: allowlist Dictionary agar torch.load bisa unpickle
+    with torch.serialization.safe_globals([Dictionary]):
+        models, _, _ = checkpoint_utils.load_model_ensemble_and_task(
+            ["hubert_base.pt"],
+            suffix="",
+            strict=False
+        )
     hubert_model = models[0]
     hubert_model = hubert_model.to(config.device)
     if config.is_half:
@@ -120,6 +126,33 @@ print("Hubert model loaded.")
 print("Loading rmvpe model...")
 rmvpe_model = RMVPE("rmvpe.pt", config.is_half, config.device)
 print("rmvpe model loaded.")
+
+
+async def _run_edge_tts(tts_text, tts_voice, speed_str, edge_output_filename):
+    """Helper to run edge-tts async. Can be called from sync or async context."""
+    await edge_tts.Communicate(
+        tts_text, "-".join(tts_voice.split("-")[:-1]), rate=speed_str
+    ).save(edge_output_filename)
+
+
+def _call_async_from_sync(coro):
+    """Call async coroutine from sync context, handling existing event loops."""
+    try:
+        # Try to get running loop (will raise if no loop in current thread)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop, safe to use asyncio.run()
+        return asyncio.run(coro)
+    else:
+        # We're already in an event loop (e.g., from FastAPI)
+        # We can't use asyncio.run(), so we need a workaround
+        import concurrent.futures
+        import threading
+        
+        # Run in a new thread with its own event loop
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(asyncio.run, coro)
+            return future.result()
 
 
 def tts(
@@ -152,14 +185,9 @@ def tts(
             )
         tgt_sr, net_g, vc, version, index_file, if_f0 = model_data(model_name)
         t0 = time.time()
-        if speed >= 0:
-            speed_str = f"+{speed}%"
-        else:
-            speed_str = f"{speed}%"
-        asyncio.run(
-            edge_tts.Communicate(
-                tts_text, "-".join(tts_voice.split("-")[:-1]), rate=speed_str
-            ).save(edge_output_filename)
+        speed_str = f"+{speed}%" if speed >= 0 else f"{speed}%"
+        _call_async_from_sync(
+            _run_edge_tts(tts_text, tts_voice, speed_str, edge_output_filename)
         )
         t1 = time.time()
         edge_time = t1 - t0
@@ -175,7 +203,6 @@ def tts(
             )
 
         f0_up_key = int(f0_up_key)
-
         if not hubert_model:
             load_hubert()
         if f0_method == "rmvpe":
@@ -191,7 +218,6 @@ def tts(
             f0_up_key,
             f0_method,
             index_file,
-            # file_big_npy,
             index_rate,
             if_f0,
             filter_radius,
@@ -206,11 +232,7 @@ def tts(
             tgt_sr = resample_sr
         info = f"Success. Time: edge-tts: {edge_time}s, npy: {times[0]}s, f0: {times[1]}s, infer: {times[2]}s"
         print(info)
-        return (
-            info,
-            edge_output_filename,
-            (tgt_sr, audio_opt),
-        )
+        return info, edge_output_filename, (tgt_sr, audio_opt)
     except EOFError:
         info = (
             "It seems that the edge-tts output is not valid. "
@@ -246,25 +268,12 @@ with app:
         with gr.Column():
             f0_method = gr.Radio(
                 label="Pitch extraction method (pm: very fast, low quality, rmvpe: a little slow, high quality)",
-                choices=["pm", "rmvpe"],  # harvest and crepe is too slow
+                choices=["pm", "rmvpe"],
                 value="rmvpe",
                 interactive=True,
             )
-            index_rate = gr.Slider(
-                minimum=0,
-                maximum=1,
-                label="Index rate",
-                value=1,
-                interactive=True,
-            )
-            protect0 = gr.Slider(
-                minimum=0,
-                maximum=0.5,
-                label="Protect",
-                value=0.33,
-                step=0.01,
-                interactive=True,
-            )
+            index_rate = gr.Slider(minimum=0, maximum=1, label="Index rate", value=1, interactive=True)
+            protect0 = gr.Slider(minimum=0, maximum=0.5, label="Protect", value=0.33, step=0.01, interactive=True)
     with gr.Row():
         with gr.Column():
             tts_voice = gr.Dropdown(
@@ -273,14 +282,7 @@ with app:
                 allow_custom_value=False,
                 value="ja-JP-NanamiNeural-Female",
             )
-            speed = gr.Slider(
-                minimum=-100,
-                maximum=100,
-                label="Speech speed (%)",
-                value=0,
-                step=10,
-                interactive=True,
-            )
+            speed = gr.Slider(minimum=-100, maximum=100, label="Speech speed (%)", value=0, step=10, interactive=True)
             tts_text = gr.Textbox(label="Input Text", value="これは日本語テキストから音声への変換デモです。")
         with gr.Column():
             but0 = gr.Button("Convert", variant="primary")
@@ -288,78 +290,30 @@ with app:
         with gr.Column():
             edge_tts_output = gr.Audio(label="Edge Voice", type="filepath")
             tts_output = gr.Audio(label="Result")
-        but0.click(
-            tts,
-            [
-                model_name,
-                speed,
-                tts_text,
-                tts_voice,
-                f0_key_up,
-                f0_method,
-                index_rate,
-                protect0,
-            ],
-            [info_text, edge_tts_output, tts_output],
-        )
+        but0.click(tts, [model_name, speed, tts_text, tts_voice, f0_key_up, f0_method, index_rate, protect0],
+                   [info_text, edge_tts_output, tts_output])
     with gr.Row():
         examples = gr.Examples(
             examples_per_page=100,
             examples=[
                 ["これは日本語テキストから音声への変換デモです。", "ja-JP-NanamiNeural-Female"],
-                [
-                    "This is an English text to speech conversation demo.",
-                    "en-US-AriaNeural-Female",
-                ],
+                ["This is an English text to speech conversation demo.", "en-US-AriaNeural-Female"],
                 ["这是一个中文文本到语音的转换演示。", "zh-CN-XiaoxiaoNeural-Female"],
                 ["한국어 텍스트에서 음성으로 변환하는 데모입니다.", "ko-KR-SunHiNeural-Female"],
-                [
-                    "Il s'agit d'une démo de conversion du texte français à la parole.",
-                    "fr-FR-DeniseNeural-Female",
-                ],
-                [
-                    "Dies ist eine Demo zur Umwandlung von Deutsch in Sprache.",
-                    "de-DE-AmalaNeural-Female",
-                ],
-                [
-                    "Tämä on suomenkielinen tekstistä puheeksi -esittely.",
-                    "fi-FI-NooraNeural-Female",
-                ],
-                [
-                    "Это демонстрационный пример преобразования русского текста в речь.",
-                    "ru-RU-SvetlanaNeural-Female",
-                ],
-                [
-                    "Αυτή είναι μια επίδειξη μετατροπής ελληνικού κειμένου σε ομιλία.",
-                    "el-GR-AthinaNeural-Female",
-                ],
-                [
-                    "Esta es una demostración de conversión de texto a voz en español.",
-                    "es-ES-ElviraNeural-Female",
-                ],
-                [
-                    "Questa è una dimostrazione di sintesi vocale in italiano.",
-                    "it-IT-ElsaNeural-Female",
-                ],
-                [
-                    "Esta é uma demonstração de conversão de texto em fala em português.",
-                    "pt-PT-RaquelNeural-Female",
-                ],
-                [
-                    "Це демонстрація тексту до мовлення українською мовою.",
-                    "uk-UA-PolinaNeural-Female",
-                ],
-                [
-                    "هذا عرض توضيحي عربي لتحويل النص إلى كلام.",
-                    "ar-EG-SalmaNeural-Female",
-                ],
-                [
-                    "இது தமிழ் உரையிலிருந்து பேச்சு மாற்ற டெமோ.",
-                    "ta-IN-PallaviNeural-Female",
-                ],
+                ["Il s'agit d'une démo de conversion du texte français à la parole.", "fr-FR-DeniseNeural-Female"],
+                ["Dies ist eine Demo zur Umwandlung von Deutsch in Sprache.", "de-DE-AmalaNeural-Female"],
+                ["Tämä on suomenkielinen tekstistä puheeksi -esittely.", "fi-FI-NooraNeural-Female"],
+                ["Это демонстрационный пример преобразования русского текста в речь.", "ru-RU-SvetlanaNeural-Female"],
+                ["Αυτή είναι μια επίδειξη μετατροπής ελληνικού κειμένου σε ομιλία.", "el-GR-AthinaNeural-Female"],
+                ["Esta es una demostración de conversión de texto a voz en español.", "es-ES-ElviraNeural-Female"],
+                ["Questa è una dimostrazione di sintesi vocale in italiano.", "it-IT-ElsaNeural-Female"],
+                ["Esta é uma demonstração de conversão de texto em fala em português.", "pt-PT-RaquelNeural-Female"],
+                ["Це демонстрація тексту до мовлення українською мовою.", "uk-UA-PolinaNeural-Female"],
+                ["هذا عرض توضيحي عربي لتحويل النص إلى كلام.", "ar-EG-SalmaNeural-Female"],
+                ["இது தமிழ் உரையிலிருந்து பேச்சு மாற்ற டெமோ.", "ta-IN-PallaviNeural-Female"],
             ],
             inputs=[tts_text, tts_voice],
         )
 
-
-app.launch(inbrowser=True)
+if __name__ == "__main__":
+    app.launch(inbrowser=True)
